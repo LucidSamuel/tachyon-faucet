@@ -6,6 +6,8 @@ import re
 import tomllib
 from urllib.parse import urlsplit
 
+from .client_ip import canonical_ip
+
 FEE = 50_000
 MAX_MONEY = 21_000_000 * 100_000_000
 # pasta_curves::Fp uses canonical little-endian 32-byte encodings.
@@ -43,6 +45,7 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 4142
     allowed_origins: tuple = ("https://tachyscan.cnode.phd",)
+    trusted_proxy_ips: tuple = ()
     amount_zat: int = 1_000_000
     cooldown_seconds: int = 300
     auto_shield: bool = True
@@ -81,6 +84,10 @@ def load_config(path):
         raise ValueError("shield_amount_zat must cover a claim plus its fee")
     if not isinstance(config.host, str) or not config.host:
         raise ValueError("host must be nonempty")
+    if not isinstance(config.trusted_proxy_ips, (list, tuple)):
+        raise ValueError("trusted_proxy_ips must be a list of literal IP addresses")
+    for proxy in config.trusted_proxy_ips:
+        canonical_ip(proxy)
     if not isinstance(config.allowed_origins, (list, tuple)) or not config.allowed_origins:
         raise ValueError("allowed_origins must be a nonempty list")
     for origin in config.allowed_origins:

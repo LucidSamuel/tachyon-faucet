@@ -1,6 +1,7 @@
-"""One wallet worker, durable payments, and a global admission cooldown."""
+"""One wallet worker, durable payments, and a per-IP admission cooldown."""
 
 import asyncio
+import hmac
 import json
 import logging
 from pathlib import Path
@@ -8,6 +9,7 @@ import tempfile
 import time
 
 from .config import FEE, HEX32, address, field, token_digest
+from .client_ip import canonical_ip
 from .store import Rejected
 from .pow import Challenges
 
@@ -34,11 +36,19 @@ class Faucet:
         self.wake = asyncio.Event()
         self.last_submit = {}
         self.store.pin("wallet_dir", str(config.wallet_dir.resolve()))
-        self.challenges = Challenges(store.challenge_key(), config, clock)
+        self.challenge_key = store.challenge_key()
+        self.challenges = Challenges(self.challenge_key, config, clock)
 
-    def status(self):
+    def client_key(self, client_ip):
+        # Persist only a keyed digest. Domain separation permits reusing the
+        # private challenge key without exposing raw IPs in the journal or API.
+        return hmac.digest(self.challenge_key, b"TachyonFaucet/IP/v1\0" + canonical_ip(client_ip).encode(),
+                           "sha256").hex()
+
+    def status(self, client_ip):
         now = self.clock()
-        remaining = max(0, self.store.deadline() - now)
+        deadline = self.store.deadline(self.client_key(client_ip))
+        remaining = max(0, deadline - now)
         active = self.store.active()
         fresh = self.last_checked > 0 and now - self.last_checked <= max(60, self.config.poll_seconds * 3) * 1000
         wallet_ready = self.phase == "ready" and fresh
@@ -51,7 +61,7 @@ class Faucet:
         else:
             reason = self.phase
         return dict(amount_zat=self.config.amount_zat, cooldown_seconds=self.config.cooldown_seconds,
-                    server_time_ms=now, next_claim_at_ms=self.store.deadline(),
+                    server_time_ms=now, next_claim_at_ms=deadline, cooldown_scope="ip",
                     remaining_ms=remaining, accepting=wallet_ready and not active and not remaining,
                     reason=reason)
 
@@ -61,20 +71,21 @@ class Faucet:
             raise Rejected(400, "Use your own wallet's payment key, not the faucet's")
         return digest, recipient
 
-    def challenge(self, token, recipient):
+    def challenge(self, token, recipient, client_ip):
         digest, recipient = self.validate_request(token, recipient)
-        status = self.status()
+        status = self.status(client_ip)
         if not status["accepting"]:
             raise Rejected(429 if status["remaining_ms"] else 503, "The faucet is not ready for a new puzzle")
         return self.challenges.issue(digest, recipient)
 
-    def claim(self, token, recipient, proof=None):
+    def claim(self, token, recipient, client_ip, proof=None):
         digest, recipient = self.validate_request(token, recipient)
         # Existing durable claims are their own replay protection: an accepted
         # token can only recover that payment, even after its puzzle expires.
         if self.store.by_token(digest) is None:
             self.challenges.verify(proof, digest, recipient)
-        result = self.store.claim(digest, recipient, self.config, self.clock(), self.status()["accepting"])
+        result = self.store.claim(digest, recipient, self.client_key(client_ip), self.config,
+                                  self.clock(), self.status(client_ip)["accepting"])
         self.wake.set()
         return public_claim(result)
 

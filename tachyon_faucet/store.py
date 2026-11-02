@@ -50,8 +50,8 @@ class Store:
         self.db.executescript("""
             PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS cooldown(id INTEGER PRIMARY KEY CHECK(id=1), until_ms INTEGER NOT NULL);
-            INSERT OR IGNORE INTO cooldown VALUES(1,0);
+            CREATE TABLE IF NOT EXISTS ip_cooldowns(ip_hash TEXT PRIMARY KEY, until_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ip_cooldowns_expiry ON ip_cooldowns(until_ms);
             CREATE TABLE IF NOT EXISTS operations(
                 id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, kind TEXT NOT NULL,
                 address TEXT, amount_zat INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
@@ -71,8 +71,11 @@ class Store:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO metadata VALUES(?,?)", (key, encoded))
 
-    def deadline(self):
-        return self.db.execute("SELECT until_ms FROM cooldown WHERE id=1").fetchone()[0]
+    def deadline(self, ip_hash):
+        # The old global cooldown table, if present, is intentionally unused:
+        # earlier claims did not record an IP, so their deadlines cannot migrate.
+        row = self.db.execute("SELECT until_ms FROM ip_cooldowns WHERE ip_hash=?", (ip_hash,)).fetchone()
+        return row[0] if row else 0
 
     def challenge_key(self):
         # Persist alongside claims so an in-progress puzzle survives a restart.
@@ -92,7 +95,7 @@ class Store:
     def get(self, operation_id):
         return dict(self.db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
 
-    def claim(self, digest, address, config, now_ms, ready):
+    def claim(self, digest, address, ip_hash, config, now_ms, ready):
         # No await between these checks and commit: a concurrent visitor cannot
         # pass the cooldown before the winning claim reserves it.
         self.db.execute("BEGIN IMMEDIATE")
@@ -103,8 +106,8 @@ class Store:
                     raise Rejected(409, "This claim token already belongs to another address")
                 self.db.commit()
                 return existing
-            if now_ms < self.deadline():
-                raise Rejected(429, "The global faucet cooldown is still running")
+            if now_ms < self.deadline(ip_hash):
+                raise Rejected(429, "The faucet cooldown for your IP address is still running")
             if self.active():
                 raise Rejected(503, "The faucet is finishing an earlier payment")
             if not ready:
@@ -113,8 +116,10 @@ class Store:
             self.db.execute(
                 "INSERT INTO operations(id,token_hash,kind,address,amount_zat,created_ms) VALUES(?,?,'send',?,?,?)",
                 (operation_id, digest, address, config.amount_zat, now_ms))
-            self.db.execute("UPDATE cooldown SET until_ms=? WHERE id=1",
-                            (now_ms + config.cooldown_seconds * 1000,))
+            self.db.execute("DELETE FROM ip_cooldowns WHERE until_ms<=?", (now_ms,))
+            self.db.execute("INSERT INTO ip_cooldowns(ip_hash,until_ms) VALUES(?,?) "
+                            "ON CONFLICT(ip_hash) DO UPDATE SET until_ms=excluded.until_ms",
+                            (ip_hash, now_ms + config.cooldown_seconds * 1000))
             self.db.commit()
             return self.get(operation_id)
         except BaseException:

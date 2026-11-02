@@ -8,7 +8,10 @@ import math
 from aiohttp import web
 
 from .service import public_claim
+from .client_ip import canonical_ip, request_ip
 from .store import Rejected
+
+CLIENT_IP = web.RequestKey("client_ip", str)
 
 
 def response(data, status=200, headers=None):
@@ -16,19 +19,27 @@ def response(data, status=200, headers=None):
 
 
 def create_app(faucet, *, start_worker=True):
+    trusted_proxies = frozenset(canonical_ip(ip) for ip in faucet.config.trusted_proxy_ips)
+
     @web.middleware
     async def boundaries(request, handler):
+        client_ip = None
         try:
             origin = request.headers.get("Origin")
             if ((origin and origin not in faucet.config.allowed_origins) or
                     request.headers.get("Sec-Fetch-Site") == "cross-site"):
                 raise Rejected(403, "Cross-origin requests are not allowed")
+            client_ip = request_ip(request, trusted_proxies)
+            request[CLIENT_IP] = client_ip
             result = await handler(request)
         except Rejected as error:
             headers = {}
+            data = dict(error=str(error))
+            if client_ip is not None:
+                data["status"] = faucet.status(client_ip)
             if error.status == 429:
-                headers["Retry-After"] = str(max(1, math.ceil(faucet.status()["remaining_ms"] / 1000)))
-            result = response(dict(error=str(error), status=faucet.status()), error.status, headers)
+                headers["Retry-After"] = str(max(1, math.ceil(data["status"]["remaining_ms"] / 1000)))
+            result = response(data, error.status, headers)
         except (ValueError, json.JSONDecodeError):
             result = response(dict(error="Invalid request: enter a canonical Tachyon payment key and claim token"), 400)
         except TimeoutError:
@@ -49,7 +60,7 @@ def create_app(faucet, *, start_worker=True):
         return authorization[7:]
 
     async def status(request):
-        return response(faucet.status())
+        return response(faucet.status(request[CLIENT_IP]))
 
     async def body(request):
         if request.content_type != "application/json":
@@ -64,14 +75,14 @@ def create_app(faucet, *, start_worker=True):
         data = await body(request)
         if set(data) != {"address", "token"}:
             raise ValueError("Invalid challenge request")
-        return response(faucet.challenge(data["token"], data["address"]))
+        return response(faucet.challenge(data["token"], data["address"], request[CLIENT_IP]))
 
     async def create(request):
         data = await body(request)
         if not {"address", "token"} <= data.keys() or data.keys() - {"address", "token", "proof"}:
             raise ValueError("Invalid claim request")
-        claim = faucet.claim(data["token"], data["address"], data.get("proof"))
-        return response(dict(claim=claim, status=faucet.status()), 202)
+        claim = faucet.claim(data["token"], data["address"], request[CLIENT_IP], data.get("proof"))
+        return response(dict(claim=claim, status=faucet.status(request[CLIENT_IP])), 202)
 
     async def claim(request):
         return response(public_claim(faucet.get_claim(claim_token(request))))

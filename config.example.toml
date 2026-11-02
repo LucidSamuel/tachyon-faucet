@@ -5,9 +5,12 @@ state_dir = "/home/ubuntu/tachyon-faucet-data/state"
 host = "127.0.0.1"
 port = 4142
 allowed_origins = ["https://tachyscan.cnode.phd"]
+# Trust only the local nginx proxy; it must overwrite X-Real-IP with $remote_addr.
+# For direct connections without a reverse proxy, use [].
+trusted_proxy_ips = ["127.0.0.1", "::1"]
 
 amount_zat = 1000000             # 0.01 testnet ZEC per claim; faucet pays fees
-cooldown_seconds = 300          # One accepted claim globally every five minutes
+cooldown_seconds = 300          # One accepted claim per IP every five minutes
 pow_difficulty_bits = 7         # Equihash solution target; +1 doubles expected work
 pow_challenge_seconds = 600     # Time to solve and submit a challenge
 auto_shield = true

@@ -6,11 +6,11 @@ recipient note JSON. Devtool retains all keys, signing, proof construction,
 input selection, and chain validation. There is no trial decryption: the recipient
 must import that JSON into the wallet that owns the payment key.
 
-Defaults: **0.01 testnet ZEC per claim**, **one claim every five minutes globally**.
+Defaults: **0.01 testnet ZEC per claim**, **one claim every five minutes per IP**.
 New claims also require a browser Equihash puzzle. Tachyscan solves it in a Web
 Worker and displays an animated activity bar, elapsed time, and a cancel button.
-The cooldown starts when a claim is accepted, survives restarts, and is shown to
-every visitor. A pending payment or wallet refill can keep the faucet unavailable
+Each IP's cooldown starts when its claim is accepted, survives restarts, and is
+shown only to visitors using that IP. A pending payment or wallet refill can keep the faucet unavailable
 after the timer expires. This service uses the experimental mock-proof wallet and
 must only hold testnet funds.
 
@@ -62,8 +62,9 @@ concurrently with another service or manual spending commands.
 | `state_dir` | Required | Private durable claims and receipt storage |
 | `host`, `port` | `127.0.0.1`, `4142` | Local HTTP listener |
 | `allowed_origins` | `["https://tachyscan.cnode.phd"]` | Exact frontend origins, without trailing slashes |
+| `trusted_proxy_ips` | `[]` | Literal IPs of reverse proxies allowed to supply `X-Real-IP` |
 | `amount_zat` | `1000000` | Recipient amount; fees are additional |
-| `cooldown_seconds` | `300` | Global minimum interval between accepted claims |
+| `cooldown_seconds` | `300` | Minimum interval between accepted claims from the same IP |
 | `pow_difficulty_bits` | `7` | Equihash solution target, 0–16; each extra bit doubles expected work |
 | `pow_challenge_seconds` | `600` | Challenge lifetime, 60–3600 seconds |
 | `auto_shield` | `true` | Replenish Tachyon funds from transparent funds |
@@ -74,6 +75,46 @@ concurrently with another service or manual spending commands.
 Restart after configuration changes. Existing claims retain their original
 amounts, recipients, and cooldown deadlines. Wallet and state directories must be
 mode `0700`; the service creates its SQLite files with mode `0600`.
+
+## Per-IP cooldown and reverse proxy
+
+Keep `cooldown_seconds = 300` for five minutes per IP. There is no global timer.
+The wallet still handles one payment at a time: other visitors can see
+`processing` until that payment confirms, then claim immediately without waiting
+for the first IP's cooldown. People sharing a public IP share the limit. IPv6
+addresses are counted individually; equivalent IPv6 spellings and IPv4-mapped
+IPv6 addresses are normalized.
+
+For the existing local nginx deployment, add this to the faucet's config:
+
+```toml
+trusted_proxy_ips = ["127.0.0.1", "::1"]
+```
+
+Add this line inside nginx's existing `/api/faucet/` location (also included in
+`deploy/nginx-faucet.conf`):
+
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+```
+
+Both changes are required. nginx must **overwrite** the header, never copy a
+visitor-supplied value. The faucet trusts it only when the actual socket peer is
+in `trusted_proxy_ips`; other peers are identified by their socket address and
+their forwarding headers are ignored. A trusted peer with a missing, duplicate,
+or malformed `X-Real-IP` gets HTTP 400 rather than silently sharing one proxy
+cooldown. Keep port 4142 local. If a CDN sits in front of nginx, configure nginx's
+real-IP handling for that CDN's trusted addresses first; otherwise the CDN's
+egress IP will be counted. Without a proxy, leave `trusted_proxy_ips = []`.
+
+Cooldown keys are HMACs of canonical IPs, using the private persistent service
+key; raw IPs are not written to SQLite or returned by the API. Expired entries
+are removed when a new claim is admitted. A retry with an already accepted claim
+token recovers that payment without consuming a cooldown on a new IP.
+
+Upgrading from the global timer creates the per-IP table automatically. The old
+global deadline is ignored because earlier claims have no recorded IP; existing
+claims and receipts are preserved. **Do not reset either database.**
 
 ## Browser proof of work
 
@@ -94,8 +135,10 @@ random, so the UI shows activity rather than a misleading completion percentage.
 Cancellation and navigation immediately terminate the Worker.
 
 Challenges are HMAC-signed, expire, and bind the recipient and private claim
-token. Issuing one does not reserve the global cooldown. If another visitor
-claims first, the loser can try again after cooldown. The signing key is created
+token. Issuing one does not reserve funds or start an IP cooldown. If another
+visitor claims first, wait until the wallet is ready and retry the saved proof
+before it expires; only a claim from the same IP starts that IP's cooldown.
+The signing key is created
 automatically in the existing private SQLite metadata and survives restarts.
 An outstanding signed challenge retains its issued difficulty after a config
 change, until expiry. Once accepted, its token only recovers the original claim;
@@ -105,13 +148,15 @@ proofs moved to another token/recipient are rejected.
 Deploy **both the faucet service and the rebuilt Tachyscan frontend** for this
 change; old frontend code cannot create new claims. Existing claims and receipt
 downloads keep working. No wallet/database reset is needed. Keep the existing
-nginx `/api/faucet/` proxy; the new challenge endpoint uses the same route.
+nginx `/api/faucet/` proxy with the IP-header configuration above; the new
+challenge endpoint uses the same route.
 
-After copying/pulling the changes on the server:
+After copying/pulling the changes and updating the faucet and nginx configs above:
 
 ```sh
 cd ~/tachyon-faucet
 .venv/bin/python -m pip install .
+sudo nginx -t && sudo systemctl reload nginx
 sudo systemctl restart tachyon-faucet
 cd ~/tachyscan
 bun install
@@ -143,7 +188,7 @@ First run in the foreground to check the paths and wallet:
 ```sh
 .venv/bin/python -m tachyon_faucet --config config.local.toml
 # In a second terminal:
-curl -s http://127.0.0.1:4142/api/faucet/status
+curl -s -H 'X-Real-IP: 127.0.0.1' http://127.0.0.1:4142/api/faucet/status
 ```
 
 Initial synchronization can take time. Status reports `syncing`, `funding`, or
@@ -177,16 +222,19 @@ sudo systemctl reload nginx
 ```
 
 Build and restart Tachyscan using its normal deployment workflow. Its faucet page
-now accepts a bare payment key or `tachyon-test:` address, polls shared status,
+now accepts a bare payment key or `tachyon-test:` address, polls its IP's status,
 and downloads the exact note JSON that devtool's `receive --receipt` accepts.
 The browser saves a private random claim token in session storage before sending.
 Refreshing the same tab recovers its payment; a lost response can be retried
 without creating a second payment. Download the note before closing the tab.
 
-For frontend development, add `"http://localhost:5173"` to `allowed_origins`, run
+For frontend development, set `trusted_proxy_ips = []`, add
+`"http://127.0.0.1:5173"` to `allowed_origins`, run
 this service on 4142, and run `bun run dev` in Tachyscan. Vite proxies the faucet
 API separately from the explorer API. HTTP on localhost works; public deployment
 needs HTTPS for the browser's secure random-number API.
+Local development through Vite counts requests as localhost; use nginx to test
+multiple clients' real IPs.
 
 ## Recovery and storage
 
@@ -210,17 +258,17 @@ Clients cannot choose payment amounts. Cross-origin browser requests are rejecte
 
 | Request | Result |
 | --- | --- |
-| `GET /api/faucet/status` | Public amount, availability, server time, and `remaining_ms` |
+| `GET /api/faucet/status` | Public amount, availability, server time, `cooldown_scope: "ip"`, and this IP's `remaining_ms` |
 | `POST /api/faucet/challenge` | `{ "address": "tachyon-test:…", "token": "<32 random bytes as lowercase hex>" }`; returns a signed puzzle while the faucet is available |
 | `POST /api/faucet/claims` | Same address/token plus `proof: {ticket, nonce, indices}`; returns claim and status. Existing accepted tokens may omit the proof |
 | `GET /api/faucet/claim` | Private claim state; requires `Authorization: Bearer <token>` |
 | `GET /api/faucet/claim/receipt` | Exact recipient note JSON attachment; same authorization |
 
-A new claim returns 202; a global cooldown returns 429 with `Retry-After`; an
+A new claim returns 202; a per-IP cooldown returns 429 with `Retry-After`; an
 unready wallet returns 503. Reusing the same token and address returns the same
 claim, including during cooldown. Never put the token in a URL. Status contains
-no recipient keys or receipts. Global limiting is intentionally simple: a visitor
-can occupy each available slot, so this does not guarantee fairness.
+no IP addresses, IP hashes, recipient keys, or receipts. Every new claim still
+requires a valid Equihash proof, regardless of which IP submits it.
 
 The challenge response contains `ticket`, `input` (32-byte hex), `n: 96`, `k: 5`,
 `difficulty_bits`, `expires_ms`, and `valid_for_ms`. Expired proofs return 410;
@@ -245,3 +293,5 @@ refilling, receipt validation/privacy, and subprocess cancellation. They do not
 connect to a live node or send funds.
 Equihash tests include upstream librustzcash vectors, a shared browser/Python
 fixture, malformed/expired/bound proofs, concurrent replay, and restart recovery.
+IP tests cover independent cooldowns, same-IP races, trusted proxy boundaries,
+address normalization, persistence, legacy migration, and private storage.

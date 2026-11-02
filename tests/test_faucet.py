@@ -51,7 +51,7 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
     def operation(self):
         return self.store.by_token(token_digest(TOKEN))
 
-    async def test_global_cooldown_allows_one_of_ten_simultaneous_visitors(self):
+    async def test_per_ip_cooldown_allows_one_of_ten_simultaneous_requests(self):
         responses = await asyncio.gather(*(self.post(f"{index:064x}") for index in range(10)))
         self.assertEqual(sorted(r.status for r in responses), [202] + [429] * 9)
         status = await (await self.client.get("/api/faucet/status")).json()
@@ -79,36 +79,36 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
         self.store = Store(self.config.state_dir)
         restarted = Faucet(replace(self.config, cooldown_seconds=1, amount_zat=2_000_000),
                            self.store, self.wallet, lambda: self.time)
-        self.assertEqual(restarted.status()["remaining_ms"], 300_000)
-        self.assertEqual(restarted.claim(TOKEN, RECIPIENT)["amount_zat"], 1_000_000)
+        self.assertEqual(restarted.status("127.0.0.1")["remaining_ms"], 300_000)
+        self.assertEqual(restarted.claim(TOKEN, RECIPIENT, "127.0.0.1")["amount_zat"], 1_000_000)
         with self.assertRaises(Rejected):
-            restarted.claim("22" * 32, RECIPIENT)
+            restarted.claim("22" * 32, RECIPIENT, "127.0.0.1")
 
     async def test_pending_payment_still_blocks_when_cooldown_ends(self):
         await self.post()
         self.time += 300_001
-        self.assertEqual(self.faucet.status()["reason"], "processing")
+        self.assertEqual(self.faucet.status("127.0.0.1")["reason"], "processing")
         self.assertEqual((await self.post("22" * 32)).status, 503)
 
     async def test_invalid_key_does_not_consume_cooldown(self):
         for recipient in ("tmAnAddress", "$(touch owned)", "ff" * 32,
                           PALLAS_BASE.to_bytes(32, "little").hex()):
             self.assertEqual((await self.post(recipient=recipient)).status, 400)
-            self.assertEqual(self.store.deadline(), 0)
+            self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
         self.assertEqual((await self.post(recipient=KEY.upper())).status, 202)
         self.assertEqual(self.operation()["address"], RECIPIENT)
 
     async def test_rejects_self_payment(self):
         self.assertEqual((await self.post(recipient=self.faucet.identity["tachyon_address"])).status, 400)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
 
     async def test_unavailable_wallet_rejects_without_charging_cooldown(self):
         self.faucet.phase = "empty"
         self.assertEqual((await self.post()).status, 503)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
         self.faucet.phase = "ready"
         self.time += 61_000
-        self.assertFalse(self.faucet.status()["accepting"])
+        self.assertFalse(self.faucet.status("127.0.0.1")["accepting"])
 
     async def test_receipt_download_is_private_and_exact_devtool_format(self):
         await self.post()
@@ -154,11 +154,11 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
         await self.faucet.tick()
         self.time += 300_000
         await self.faucet.tick()
-        self.assertTrue(self.faucet.status()["accepting"])
+        self.assertTrue(self.faucet.status("127.0.0.1")["accepting"])
         self.wallet.operations[op["id"]]["status"] = "pending"
         self.wallet.height += 1
         await self.faucet.tick()
-        self.assertFalse(self.faucet.status()["accepting"])
+        self.assertFalse(self.faucet.status("127.0.0.1")["accepting"])
         self.wallet.operations[op["id"]]["status"] = "expired"
         await self.faucet.tick()
         self.assertEqual(self.operation()["state"], "expired")
@@ -198,24 +198,24 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
         refill = self.store.active()[0]
         self.assertEqual(refill["kind"], "shield")
         self.assertEqual(refill["amount_zat"], 100_000_000)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
         await self.faucet.tick()
         await self.faucet.tick()
         self.assertEqual(self.wallet.send_count, 1)
-        self.assertEqual(self.faucet.status()["reason"], "funding")
+        self.assertEqual(self.faucet.status("127.0.0.1")["reason"], "funding")
         self.wallet.operations[refill["id"]]["status"] = "mined"
         self.wallet.balance["notes"] = [dict(status="available", value_zat=100_000_000)]
         await self.faucet.tick()
-        self.assertTrue(self.faucet.status()["accepting"])
+        self.assertTrue(self.faucet.status("127.0.0.1")["accepting"])
 
     async def test_no_funds_or_partial_sync_does_not_create_payments(self):
         self.wallet.caught_up = False
         await self.faucet.tick()
-        self.assertEqual(self.faucet.status()["reason"], "syncing")
+        self.assertEqual(self.faucet.status("127.0.0.1")["reason"], "syncing")
         self.wallet.caught_up = True
         self.wallet.balance = dict(notes=[], transparent=None)
         await self.faucet.tick()
-        self.assertEqual(self.faucet.status()["reason"], "empty")
+        self.assertEqual(self.faucet.status("127.0.0.1")["reason"], "empty")
         self.assertFalse(self.store.active())
 
     async def test_state_is_exclusive_and_pinned_to_wallet(self):
@@ -235,7 +235,7 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(too_large.status, 413)
         malformed = await self.client.post("/api/faucet/claims", json=dict(token=TOKEN, address=RECIPIENT, amount_zat=999))
         self.assertEqual(malformed.status, 400)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
 
 
 class ConfigTests(unittest.TestCase):

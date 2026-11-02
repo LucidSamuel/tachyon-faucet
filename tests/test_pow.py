@@ -79,7 +79,7 @@ class PowAdmissionTests(unittest.IsolatedAsyncioTestCase):
             result = await self.client.post("/api/faucet/challenge", json=dict(token=TOKEN, address=RECIPIENT))
         self.assertEqual(result.status, 200)
         self.assertEqual(await result.json(), VECTOR["challenge"])
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
         self.assertEqual(self.store.active(), [])
         await self.post()
         blocked = await self.client.post("/api/faucet/challenge", json=dict(token="22" * 32, address=RECIPIENT))
@@ -89,18 +89,18 @@ class PowAdmissionTests(unittest.IsolatedAsyncioTestCase):
         responses = await asyncio.gather(self.post(), self.post())
         self.assertEqual([r.status for r in responses], [202, 202])
         self.assertEqual(len(self.store.active()), 1)
-        deadline = self.store.deadline()
+        deadline = self.store.deadline(self.faucet.client_key("127.0.0.1"))
         self.time = VECTOR["challenge"]["expires_ms"] + 1
         replay = await self.client.post("/api/faucet/claims", json=dict(token=TOKEN, address=RECIPIENT))
         self.assertEqual(replay.status, 202)  # No second proof or payment.
-        self.assertEqual(self.store.deadline(), deadline)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), deadline)
         self.assertEqual(len(self.store.active()), 1)
 
     async def test_no_proof_no_payment(self):
         result = await self.client.post("/api/faucet/claims", json=dict(token=TOKEN, address=RECIPIENT))
         self.assertEqual(result.status, 400)
         self.assertEqual((await self.post(None)).status, 400)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
 
     async def test_proof_cannot_move_to_another_token_or_recipient(self):
         self.assertEqual((await self.post(token="22" * 32)).status, 400)
@@ -116,7 +116,7 @@ class PowAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.post(proof)).status, 400, changes)
         self.time = VECTOR["challenge"]["expires_ms"]
         self.assertEqual((await self.post()).status, 410)
-        self.assertEqual(self.store.deadline(), 0)
+        self.assertEqual(self.store.deadline(self.faucet.client_key("127.0.0.1")), 0)
         self.assertEqual(self.store.active(), [])
 
     async def test_target_is_enforced_in_addition_to_equihash(self):
@@ -135,4 +135,4 @@ class PowAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.store = Store(self.config.state_dir)
         restarted = Faucet(replace(self.config, pow_difficulty_bits=8), self.store, Wallet(), lambda: self.time)
         await restarted.tick()
-        self.assertEqual(restarted.claim(TOKEN, RECIPIENT, VECTOR["proof"])["state"], "queued")
+        self.assertEqual(restarted.claim(TOKEN, RECIPIENT, "127.0.0.1", VECTOR["proof"])["state"], "queued")
