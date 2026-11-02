@@ -49,6 +49,8 @@ class Config:
     shield_amount_zat: int = 100_000_000
     poll_seconds: int = 15
     command_timeout: int = 1800
+    pow_difficulty_bits: int = 7
+    pow_challenge_seconds: int = 600
 
 
 def load_config(path):
@@ -68,6 +70,7 @@ def load_config(path):
         ("port", 1, 65535), ("amount_zat", 1, MAX_MONEY - FEE),
         ("cooldown_seconds", 1, 86400 * 30), ("poll_seconds", 1, 300),
         ("command_timeout", 10, 7200), ("shield_amount_zat", 1, MAX_MONEY - FEE),
+        ("pow_difficulty_bits", 0, 16), ("pow_challenge_seconds", 60, 3600),
     ):
         value = getattr(config, key)
         if type(value) is not int or not low <= value <= high:

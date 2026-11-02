@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -39,7 +40,10 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
         self.directory.cleanup()
 
     async def post(self, token=TOKEN, recipient=RECIPIENT):
-        return await self.client.post("/api/faucet/claims", json=dict(token=token, address=recipient))
+        # These tests isolate payment/cooldown behavior. test_pow exercises the
+        # real admission gate using a browser-generated Equihash proof.
+        with patch.object(self.faucet.challenges, "verify"):
+            return await self.client.post("/api/faucet/claims", json=dict(token=token, address=recipient))
 
     async def claim(self, token=TOKEN):
         return await self.client.get("/api/faucet/claim", headers={"Authorization": "Bearer " + token})
@@ -170,6 +174,24 @@ class FaucetTests(unittest.IsolatedAsyncioTestCase):
             await self.faucet.tick()
         self.assertIsNone(self.operation()["receipt"])
 
+    async def test_receipt_download_preserves_optional_transaction_locator(self):
+        self.wallet.receipt_locator = dict(height=123, block_hash="ab" * 32)
+        await self.post()
+        await self.faucet.tick()
+        downloaded = await self.client.get("/api/faucet/claim/receipt", headers={"Authorization": "Bearer " + TOKEN})
+        note = await downloaded.json()
+        self.assertEqual(note["locator"], dict(txid=self.operation()["txid"], height=123, block_hash="ab" * 32))
+
+    async def test_invalid_locator_is_not_served(self):
+        await self.post()
+        for locator in ({"txid": "ab" * 32}, {"height": -1}, {"height": True},
+                        {"height": 2**32}, {"block_hash": "invalid"}, {"unexpected": 1}):
+            with self.subTest(locator=locator):
+                self.wallet.receipt_locator = locator
+                with self.assertRaises(ValueError):
+                    await self.faucet.tick()
+                self.assertIsNone(self.operation()["receipt"])
+
     async def test_auto_shield_journals_once_and_waits_for_confirmation(self):
         self.wallet.balance = dict(notes=[], transparent=dict(available_zat=200_000_000))
         await self.faucet.tick()
@@ -234,7 +256,9 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.wallet_dir, Path(temp).resolve() / "wallet")
             for extra in ('cooldown_seconds=0', 'cooldown_seconds=true', 'unknown=1',
                           'allowed_origins=["https://example.com/path"]', 'auto_shield="yes"',
-                          'shield_amount_zat=10'):
+                          'shield_amount_zat=10', 'pow_difficulty_bits=-1',
+                          'pow_difficulty_bits=17', 'pow_difficulty_bits=true',
+                          'pow_challenge_seconds=0'):
                 path.write_text(base + extra)
                 with self.assertRaises(ValueError, msg=extra):
                     load_config(path)

@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import secrets
 from pathlib import Path
 import sqlite3
 import stat
@@ -72,6 +73,13 @@ class Store:
 
     def deadline(self):
         return self.db.execute("SELECT until_ms FROM cooldown WHERE id=1").fetchone()[0]
+
+    def challenge_key(self):
+        # Persist alongside claims so an in-progress puzzle survives a restart.
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO metadata VALUES('pow_key', ?)",
+                            (secrets.token_hex(32),))
+        return bytes.fromhex(self.db.execute("SELECT value FROM metadata WHERE key='pow_key'").fetchone()[0])
 
     def by_token(self, digest):
         row = self.db.execute("SELECT * FROM operations WHERE token_hash=?", (digest,)).fetchone()

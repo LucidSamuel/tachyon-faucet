@@ -8,6 +8,8 @@ allowed_origins = ["https://tachyscan.cnode.phd"]
 
 amount_zat = 1000000             # 0.01 testnet ZEC per claim; faucet pays fees
 cooldown_seconds = 300          # One accepted claim globally every five minutes
+pow_difficulty_bits = 7         # Equihash solution target; +1 doubles expected work
+pow_challenge_seconds = 600     # Time to solve and submit a challenge
 auto_shield = true
 shield_amount_zat = 100000000    # Refill with 1 ZEC when no spendable note is large enough
 poll_seconds = 15

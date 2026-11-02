@@ -7,6 +7,8 @@ input selection, and chain validation. There is no trial decryption: the recipie
 must import that JSON into the wallet that owns the payment key.
 
 Defaults: **0.01 testnet ZEC per claim**, **one claim every five minutes globally**.
+New claims also require a browser Equihash puzzle. Tachyscan solves it in a Web
+Worker and displays an animated activity bar, elapsed time, and a cancel button.
 The cooldown starts when a claim is accepted, survives restarts, and is shown to
 every visitor. A pending payment or wallet refill can keep the faucet unavailable
 after the timer expires. This service uses the experimental mock-proof wallet and
@@ -62,6 +64,8 @@ concurrently with another service or manual spending commands.
 | `allowed_origins` | `["https://tachyscan.cnode.phd"]` | Exact frontend origins, without trailing slashes |
 | `amount_zat` | `1000000` | Recipient amount; fees are additional |
 | `cooldown_seconds` | `300` | Global minimum interval between accepted claims |
+| `pow_difficulty_bits` | `7` | Equihash solution target, 0–16; each extra bit doubles expected work |
+| `pow_challenge_seconds` | `600` | Challenge lifetime, 60–3600 seconds |
 | `auto_shield` | `true` | Replenish Tachyon funds from transparent funds |
 | `shield_amount_zat` | `100000000` | Maximum refill amount |
 | `poll_seconds` | `15` | Wallet sync/recovery interval |
@@ -70,6 +74,52 @@ concurrently with another service or manual spending commands.
 Restart after configuration changes. Existing claims retain their original
 amounts, recipients, and cooldown deadlines. Wallet and state directories must be
 mode `0700`; the service creates its SQLite files with mode `0600`.
+
+## Browser proof of work
+
+The puzzle is Equihash(96,5), with Zcash's BLAKE2b personalization, collision
+rules, distinct indices, and canonical subtree ordering. It is separate from
+Zakura's block mining; no node or devtool changes are required. The browser uses
+bounded typed-array tables and `@noble/hashes` in a dedicated Worker, without a
+WASM toolchain, native extension, or cross-origin isolation requirement. The
+Python service verifies just 32 leaves using the standard-library `hashlib`.
+
+Difficulty is a SHA-256 target over the challenge input, nonce, and entire
+solution. Seven bits accepts about 1 in 128 valid Equihash solutions; zero still
+requires a valid Equihash solution. The default is a starting point for a short
+interactive wait, **not a calibrated 30-second M4 guarantee**. Measure several
+claims in the target browsers; increase/decrease the setting by one to roughly
+double/halve expected solve time without increasing table sizes. The search is
+random, so the UI shows activity rather than a misleading completion percentage.
+Cancellation and navigation immediately terminate the Worker.
+
+Challenges are HMAC-signed, expire, and bind the recipient and private claim
+token. Issuing one does not reserve the global cooldown. If another visitor
+claims first, the loser can try again after cooldown. The signing key is created
+automatically in the existing private SQLite metadata and survives restarts.
+An outstanding signed challenge retains its issued difficulty after a config
+change, until expiry. Once accepted, its token only recovers the original claim;
+retries do not require another proof, even after expiry. Both unsigned claims and
+proofs moved to another token/recipient are rejected.
+
+Deploy **both the faucet service and the rebuilt Tachyscan frontend** for this
+change; old frontend code cannot create new claims. Existing claims and receipt
+downloads keep working. No wallet/database reset is needed. Keep the existing
+nginx `/api/faucet/` proxy; the new challenge endpoint uses the same route.
+
+After copying/pulling the changes on the server:
+
+```sh
+cd ~/tachyon-faucet
+.venv/bin/python -m pip install .
+sudo systemctl restart tachyon-faucet
+cd ~/tachyscan
+bun install
+bun run build
+sudo systemctl restart tachyscan
+```
+
+Tachyscan's Rust binary is unchanged and serves the rebuilt `dist/` assets.
 
 ## Allow the workload miner to include faucet transactions
 
@@ -161,7 +211,8 @@ Clients cannot choose payment amounts. Cross-origin browser requests are rejecte
 | Request | Result |
 | --- | --- |
 | `GET /api/faucet/status` | Public amount, availability, server time, and `remaining_ms` |
-| `POST /api/faucet/claims` | `{ "address": "tachyon-test:…", "token": "<32 random bytes as lowercase hex>" }`; returns claim and status |
+| `POST /api/faucet/challenge` | `{ "address": "tachyon-test:…", "token": "<32 random bytes as lowercase hex>" }`; returns a signed puzzle while the faucet is available |
+| `POST /api/faucet/claims` | Same address/token plus `proof: {ticket, nonce, indices}`; returns claim and status. Existing accepted tokens may omit the proof |
 | `GET /api/faucet/claim` | Private claim state; requires `Authorization: Bearer <token>` |
 | `GET /api/faucet/claim/receipt` | Exact recipient note JSON attachment; same authorization |
 
@@ -170,6 +221,17 @@ unready wallet returns 503. Reusing the same token and address returns the same
 claim, including during cooldown. Never put the token in a URL. Status contains
 no recipient keys or receipts. Global limiting is intentionally simple: a visitor
 can occupy each available slot, so this does not guarantee fairness.
+
+The challenge response contains `ticket`, `input` (32-byte hex), `n: 96`, `k: 5`,
+`difficulty_bits`, `expires_ms`, and `valid_for_ms`. Expired proofs return 410;
+missing/invalid proofs return 400, without consuming the cooldown. Proofs use a
+32-byte hex nonce and 32 integer indices (each less than 131072), in Equihash tree
+order. The input is `SHA256("TachyonFaucet/Equihash/v1\0" || ASCII(ticket))`.
+The difficulty hash is `SHA256("TachyonFaucet/Target/v1\0" || input || nonce ||
+indices_as_big_endian_u32)` and must have at least `difficulty_bits` leading zero
+bits. Here `\0` denotes one NUL byte. Each leaf uses the standard Equihash
+`BLAKE2b-480(input || nonce || LE32(index / 5))` with personalization
+`"ZcashPoW" || LE32(96) || LE32(5)`, taking the index's 12-byte segment.
 
 ## Tests
 
@@ -181,3 +243,5 @@ Tests use synthetic wallets and temporary directories: concurrent admission,
 cooldown persistence, ambiguous broadcasts, restart/reorg/expiry recovery,
 refilling, receipt validation/privacy, and subprocess cancellation. They do not
 connect to a live node or send funds.
+Equihash tests include upstream librustzcash vectors, a shared browser/Python
+fixture, malformed/expired/bound proofs, concurrent replay, and restart recovery.

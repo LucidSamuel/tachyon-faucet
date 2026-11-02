@@ -51,14 +51,26 @@ def create_app(faucet, *, start_worker=True):
     async def status(request):
         return response(faucet.status())
 
-    async def create(request):
+    async def body(request):
         if request.content_type != "application/json":
             raise Rejected(415, "Use application/json")
         async with asyncio.timeout(10):
             data = await request.json()
-        if not isinstance(data, dict) or set(data) != {"address", "token"}:
+        if not isinstance(data, dict):
+            raise ValueError("Invalid request")
+        return data
+
+    async def challenge(request):
+        data = await body(request)
+        if set(data) != {"address", "token"}:
+            raise ValueError("Invalid challenge request")
+        return response(faucet.challenge(data["token"], data["address"]))
+
+    async def create(request):
+        data = await body(request)
+        if not {"address", "token"} <= data.keys() or data.keys() - {"address", "token", "proof"}:
             raise ValueError("Invalid claim request")
-        claim = faucet.claim(data["token"], data["address"])
+        claim = faucet.claim(data["token"], data["address"], data.get("proof"))
         return response(dict(claim=claim, status=faucet.status()), 202)
 
     async def claim(request):
@@ -80,6 +92,7 @@ def create_app(faucet, *, start_worker=True):
 
     app = web.Application(client_max_size=2048, middlewares=[boundaries])
     app.router.add_get("/api/faucet/status", status)
+    app.router.add_post("/api/faucet/challenge", challenge)
     app.router.add_post("/api/faucet/claims", create)
     app.router.add_get("/api/faucet/claim", claim)
     app.router.add_get("/api/faucet/claim/receipt", receipt)

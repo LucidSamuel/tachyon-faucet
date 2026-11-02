@@ -22,6 +22,7 @@ class Wallet:
         self.send_count = 0
         self.fail_after_save = False
         self.wrong_receipt = False
+        self.receipt_locator = None
         self.calls = []
 
     async def lookup(self, operation_id):
@@ -64,6 +65,8 @@ class Wallet:
                            psi="03" + "00" * 31, rcm="04" + "00" * 31)
             if self.wrong_receipt:
                 receipt["value_zat"] += 1
+            if self.receipt_locator is not None:
+                receipt["locator"] = {"txid": saved["txid"], **self.receipt_locator}
             path = Path(args[4])
             path.write_text(json.dumps(receipt))
             path.chmod(0o600)

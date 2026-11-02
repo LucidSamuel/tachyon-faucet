@@ -9,6 +9,7 @@ import time
 
 from .config import FEE, HEX32, address, field, token_digest
 from .store import Rejected
+from .pow import Challenges
 
 LOG = logging.getLogger("tachyon_faucet")
 
@@ -33,6 +34,7 @@ class Faucet:
         self.wake = asyncio.Event()
         self.last_submit = {}
         self.store.pin("wallet_dir", str(config.wallet_dir.resolve()))
+        self.challenges = Challenges(store.challenge_key(), config, clock)
 
     def status(self):
         now = self.clock()
@@ -53,10 +55,25 @@ class Faucet:
                     remaining_ms=remaining, accepting=wallet_ready and not active and not remaining,
                     reason=reason)
 
-    def claim(self, token, recipient):
+    def validate_request(self, token, recipient):
         digest, recipient = token_digest(token), address(recipient)
         if self.identity and recipient == self.identity["tachyon_address"]:
             raise Rejected(400, "Use your own wallet's payment key, not the faucet's")
+        return digest, recipient
+
+    def challenge(self, token, recipient):
+        digest, recipient = self.validate_request(token, recipient)
+        status = self.status()
+        if not status["accepting"]:
+            raise Rejected(429 if status["remaining_ms"] else 503, "The faucet is not ready for a new puzzle")
+        return self.challenges.issue(digest, recipient)
+
+    def claim(self, token, recipient, proof=None):
+        digest, recipient = self.validate_request(token, recipient)
+        # Existing durable claims are their own replay protection: an accepted
+        # token can only recover that payment, even after its puzzle expires.
+        if self.store.by_token(digest) is None:
+            self.challenges.verify(proof, digest, recipient)
         result = self.store.claim(digest, recipient, self.config, self.clock(), self.status()["accepting"])
         self.wake.set()
         return public_claim(result)
@@ -86,13 +103,27 @@ class Faucet:
             if len(raw) > 16384:
                 raise ValueError("Receipt exceeds 16 KiB")
             receipt = json.loads(raw)
-            if (set(receipt) != {"version", "network_id", "payment_key", "value_zat", "psi", "rcm"} or
+            required = {"version", "network_id", "payment_key", "value_zat", "psi", "rcm"}
+            if (not isinstance(receipt, dict) or not required <= receipt.keys() or
+                    receipt.keys() - required - {"locator"} or
                     receipt["version"] != 1 or
                     receipt["network_id"] != self.identity["network_id"] or
                     receipt["payment_key"] != operation["address"].removeprefix("tachyon-test:") or
                     type(receipt["value_zat"]) is not int or
                     receipt["value_zat"] != operation["amount_zat"]):
                 raise ValueError("Exported receipt does not match the claim")
+            locator = receipt.get("locator")
+            if locator is not None:
+                # Preserve devtool's optional lookup hints, bound to this payment.
+                if (not isinstance(locator, dict) or
+                        locator.keys() - {"txid", "height", "block_hash"} or
+                        locator.get("txid") != operation["txid"]):
+                    raise ValueError("Receipt locator does not match the payment")
+                height, block_hash = locator.get("height"), locator.get("block_hash")
+                if height is not None and (type(height) is not int or not 0 <= height <= 0xFFFFFFFF):
+                    raise ValueError("Invalid receipt block height")
+                if block_hash is not None and (not isinstance(block_hash, str) or not HEX32.fullmatch(block_hash)):
+                    raise ValueError("Invalid receipt block hash")
             field(receipt["payment_key"])
             field(receipt["psi"])
             if int(field(receipt["rcm"]), 16) == 0:
